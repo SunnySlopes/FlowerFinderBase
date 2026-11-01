@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.c   linguist-language=C
+*.h   linguist-language=C
+*.cpp linguist-language=C++
+*.bat text eol=crlf
+*.ps1 text eol=crlf

@@ -1,0 +1,32 @@
+# Build output
+/build/
+/build-jni/
+/dist/
+/out/
+
+# Object / binary artifacts
+*.o
+*.a
+*.obj
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.exp
+*.so
+*.dylib
+
+# IDE / editor
+.vs/
+.idea/
+.vscode/
+*.iml
+.cproject
+.project
+.cache/
+
+# OS junk
+.DS_Store
+Thumbs.db
+Desktop.ini
