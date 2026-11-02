@@ -160,6 +160,17 @@ FlowerFinderBase-cli --seed <seed> [options]
   `--out` 与 GUI 导出的文本可直接 diff。
 * 移植/升级时必须保持 `FlowerSearchControl` 的字段顺序，否则相位/进度会错位。
 
+## 许可
+
+本库以 **MIT 许可证**发布，完整文本见 [LICENSE](LICENSE)；主仓库
+[FlowerFinderGUI](https://github.com/SunnySlopes/FlowerFinderGUI) 使用同一许可证，
+因此 GUI、核心库、CLI 与 JNI 桥可以自由使用、修改与再分发（含商业用途）。
+
+```text
+Copyright (c) 2026 SunnySlopes & M33 Galaxy
+```
+
 ## 第三方
 
-见 [THIRD_PARTY.md](THIRD_PARTY.md)。cubiomes 以子模块形式引入，遵循其 MIT 许可。
+见 [THIRD_PARTY.md](THIRD_PARTY.md)。cubiomes 以子模块形式引入，保留其上游 MIT 许可
+（Copyright (c) 2020 Cubitect），不属于本库的版权声明范围。
