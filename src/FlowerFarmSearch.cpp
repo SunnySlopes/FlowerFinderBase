@@ -16,7 +16,6 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -73,6 +72,10 @@ int waitForPause(void *user)
     auto *c = static_cast<FlowerSearchControl *>(user);
     if (!c)
         return 0;
+    /* Inside a tile a pause request is honoured at the next tile boundary, so
+     * the current tile is finished first.  Stop still aborts immediately. */
+    if (c->deferPause && c->deferPause->load())
+        return (c->stopReq && c->stopReq->load()) ? 1 : 0;
     while (c->pauseReq && c->pauseReq->load())
     {
         if (c->stopReq && c->stopReq->load())
@@ -709,8 +712,9 @@ static void prepareFlowerContext(int mc, uint64_t seed, FlowerSearchContext &ctx
 }
 
 /* 单块区域：完整跑一遍筛选 + 校验。分块、合并、去重由外层
- * runFlowerFarmSearchRows() 负责；本函数不关心请求面积有多大。 */
-static std::vector<FlowerRow> runFlowerFarmSearchRegion(
+ * runFlowerFarmSearchRows() 负责；本函数不关心请求面积有多大。
+ * 返回 OutRow，让外层可以在跨块合并后按与整段搜索相同的规则排序、去重。 */
+static std::vector<OutRow> runFlowerFarmSearchRegion(
     FlowerSearchContext &ctx,
     uint64_t seed,
     int mc,
@@ -724,9 +728,10 @@ static std::vector<FlowerRow> runFlowerFarmSearchRegion(
     int frameStep,
     int threads,
     FlowerSearchControl &control,
-    const FlowerSearchOptions &options)
+    const FlowerSearchOptions &options,
+    bool dedupeResults)
 {
-    std::vector<FlowerRow> result;
+    std::vector<OutRow> result;
     if (mc == MC_UNDEF)
         mc = MC_NEWEST;
     if (maxX < minX || maxZ < minZ)
@@ -923,57 +928,25 @@ static std::vector<FlowerRow> runFlowerFarmSearchRegion(
     setOverall(control, phase1Total + candidateCount, overallTotal);
 
     /* Same rule as GUI Sort: cherry first, then nearer to origin. Sorting before
-     * de-duplication lets the preferred window win each overlap. */
-    std::sort(rows.begin(), rows.end(), rowPreferred);
-    if (!dedupeOverlappingWindows(rows, control))
-        return result;
-    if (!pauseOk(control))
-        return result;
+     * de-duplication lets the preferred window win each overlap.
+     * A tiled search skips this per-tile pass and applies the exact same rule
+     * once on the merged rows, so the result matches a single-pass search. */
+    if (dedupeResults)
+    {
+        std::sort(rows.begin(), rows.end(), rowPreferred);
+        if (!dedupeOverlappingWindows(rows, control))
+            return result;
+        if (!pauseOk(control))
+            return result;
+    }
 
     result.reserve(rows.size());
-    for (const OutRow &row : rows)
-        result.push_back(static_cast<const FlowerRow &>(row));
+    for (OutRow &row : rows)
+        result.push_back(std::move(row));
 
     setPhaseCurrent(control, phase3Total);
     setOverall(control, overallTotal, overallTotal);
     return result;
-}
-
-/* 结果合并用的偏好序：与 rowPreferred 保持同一主次（樱花优先 → 离原点近 →
- * 坐标稳定），只是这里只有公开的 FlowerRow 字段可用。 */
-static bool flowerRowPreferred(const FlowerRow &a, const FlowerRow &b)
-{
-    const bool pa = a.bonus.find("pink_petals") != std::string::npos;
-    const bool pb = b.bonus.find("pink_petals") != std::string::npos;
-    if (pa != pb)
-        return pa;
-    const int64_t da = (int64_t) a.cx * a.cx + (int64_t) a.cz * a.cz;
-    const int64_t db = (int64_t) b.cx * b.cx + (int64_t) b.cz * b.cz;
-    if (da != db)
-        return da < db;
-    if (a.cx != b.cx)
-        return a.cx < b.cx;
-    if (a.cz != b.cz)
-        return a.cz < b.cz;
-    if (a.sideX != b.sideX)
-        return a.sideX < b.sideX;
-    return a.sideZ < b.sideZ;
-}
-
-/* 同一窗口坐标在相邻块的扩展区里会各出现一次，按 (cx,cz,sideX,sideZ) 去重。 */
-static uint64_t flowerWindowKey(const FlowerRow &row)
-{
-    uint64_t h = (uint64_t)(uint32_t) row.cx;
-    h = h * 0x9E3779B97F4A7C15ull ^ (uint64_t)(uint32_t) row.cz;
-    h = h * 0x9E3779B97F4A7C15ull ^ (uint64_t)(uint32_t) row.sideX;
-    h = h * 0x9E3779B97F4A7C15ull ^ (uint64_t)(uint32_t) row.sideZ;
-    /* splitmix64 末轮，保证低位也混合。 */
-    h ^= h >> 30;
-    h *= 0xBF58476D1CE4E5B9ull;
-    h ^= h >> 27;
-    h *= 0x94D049BB133111EBull;
-    h ^= h >> 31;
-    return h;
 }
 
 /* 合并后的上限：宿主最终只保留前 1000 条，这里留足余量即可，避免极端情况下
@@ -998,6 +971,10 @@ std::vector<FlowerRow> runFlowerFarmSearchRows(
     if (maxX < minX || maxZ < minZ)
         return {};
 
+    /* 上一次分块搜索可能留下了块计数；单块搜索不报告块进度。 */
+    storeInt(control.tileTotal, 0);
+    storeInt(control.tileCurrent, 0);
+
     /* 气候/生成器/花噪声明一次，分块与单块共用。 */
     const int effectiveMc = (mc == MC_UNDEF) ? MC_NEWEST : mc;
     FlowerSearchContext ctx;
@@ -1007,59 +984,101 @@ std::vector<FlowerRow> runFlowerFarmSearchRows(
     const int64_t spanX = (int64_t) maxX - minX + 1;
     const int64_t spanZ = (int64_t) maxZ - minZ + 1;
     if (spanX <= tileSpan && spanZ <= tileSpan)
-        return runFlowerFarmSearchRegion(ctx, seed, effectiveMc, minX, minZ, maxX, maxZ,
-                                         longSide, shortSide, squareOnly,
-                                         frameStep, threads, control, options);
+    {
+        std::vector<OutRow> rows = runFlowerFarmSearchRegion(
+            ctx, seed, effectiveMc, minX, minZ, maxX, maxZ, longSide, shortSide,
+            squareOnly, frameStep, threads, control, options, true);
+        std::vector<FlowerRow> out;
+        out.reserve(rows.size());
+        for (OutRow &row : rows)
+            out.push_back(std::move(row));
+        return out;
+    }
 
-    /* 窗口边长决定块间重叠：跨块边界的窗口必须在某一块里完整出现。 */
+    /* 窗口边长决定块间重叠：跨块边界的窗口必须在某一块里完整出现，
+     * 而且重叠长度必须是 CTS 采样步长（kStep = 256 格）的整数倍；否则每块的
+     * 窗口采样栅格会相对整段搜索整体偏移，结果会随分块方式变化。
+     * kTileOverlap = 1024 格，>= 最大窗口边长，并且是 256 的整数倍。 */
     const bool square = squareOnly || shortSide == longSide;
     const int windowX = alignDown(longSide, square ? 32 : 8, square ? 64 : 8);
     const int windowZ = square ? windowX : alignDown(shortSide, 8, 8);
     if (windowX <= 0 || windowZ <= 0)
         return {};
-    const int overlap = std::max(1, std::min(kTileOverlap, std::max(windowX, windowZ)));
+    const int overlap = std::max(kTileOverlap, std::max(windowX, windowZ));
 
-    const int64_t tileCount = std::max<int64_t>(1, ((spanX + tileSpan - 1) / tileSpan) *
-                                                       ((spanZ + tileSpan - 1) / tileSpan));
-    std::vector<FlowerRow> merged;
-    int64_t done = 0;
+    /* 先列出真正会运行的分块（跳过装不下一个窗口的边缘块），
+     * 有效块数就是进度条的总数。 */
+    struct TileRect
+    {
+        int64_t x0, z0, x1, z1;
+    };
+    std::vector<TileRect> tiles;
     for (int64_t tx = minX; tx <= maxX; tx += tileSpan)
     {
+        /* 最后一块只要自己的起点已在上一块的扩展区覆盖范围内，就不用再跑：
+         * 上一块的扩展区已经覆盖到 maxX（overlap >= 最大窗口边长）。 */
+        if (tx > maxX - overlap)
+            break;
         for (int64_t tz = minZ; tz <= maxZ; tz += tileSpan)
         {
+            if (tz > maxZ - overlap)
+                break;
             const int64_t x0 = std::max<int64_t>(minX, tx - overlap);
             const int64_t z0 = std::max<int64_t>(minZ, tz - overlap);
             const int64_t x1 = std::min<int64_t>(maxX, tx + tileSpan - 1 + overlap);
             const int64_t z1 = std::min<int64_t>(maxZ, tz + tileSpan - 1 + overlap);
             if (x1 - x0 + 1 < windowX || z1 - z0 + 1 < windowZ)
                 continue; /* 太小，装不下一个窗口 */
-            if (!pauseOk(control))
-                return merged; /* 用户暂停/停止：返回已算出的部分 */
-
-            std::vector<FlowerRow> part = runFlowerFarmSearchRegion(
-                ctx, seed, effectiveMc, (int) x0, (int) z0, (int) x1, (int) z1, longSide,
-                shortSide, squareOnly, frameStep, threads, control, options);
-            merged.insert(merged.end(), std::make_move_iterator(part.begin()),
-                          std::make_move_iterator(part.end()));
-            ++done;
-            /* 分块模式下总进度按"完成的块"推进；块内仍然有各自的细进度。 */
-            setOverall(control, (int) std::min<int64_t>(done, tileCount),
-                       (int) std::min<int64_t>(tileCount, INT_MAX));
+            tiles.push_back({x0, z0, x1, z1});
         }
     }
+    const int tileCount = (int) std::min<size_t>(tiles.size(), (size_t) INT_MAX);
+    if (tileCount > 0)
+    {
+        storeInt(control.tileTotal, tileCount);
+        storeInt(control.tileCurrent, 0);
+        setOverall(control, 0, tileCount);
+    }
+
+    std::vector<OutRow> merged;
+    int done = 0;
+    for (const TileRect &tile : tiles)
+    {
+        /* 暂停只在这个块边界生效：用户点暂停后先把当前块跑完。 */
+        if (control.deferPause)
+            control.deferPause->store(false);
+        if (!pauseOk(control))
+            break; /* 停止（暂停会在这里阻塞，直到恢复） */
+        if (control.deferPause)
+            control.deferPause->store(true);
+
+        std::vector<OutRow> part = runFlowerFarmSearchRegion(
+            ctx, seed, effectiveMc, (int) tile.x0, (int) tile.z0, (int) tile.x1,
+            (int) tile.z1, longSide, shortSide, squareOnly, frameStep, threads,
+            control, options, false);
+        merged.insert(merged.end(), std::make_move_iterator(part.begin()),
+                      std::make_move_iterator(part.end()));
+        ++done;
+        storeInt(control.tileCurrent, std::min(done, tileCount));
+        setOverall(control, std::min(done, tileCount), tileCount);
+    }
+    if (control.deferPause)
+        control.deferPause->store(false);
 
     if (merged.empty())
-        return merged;
+        return {};
 
-    std::sort(merged.begin(), merged.end(), flowerRowPreferred);
-    std::unordered_set<uint64_t> seen;
-    seen.reserve(merged.size());
+    /* 与一次性遍历完全相同的收尾：按偏好序排序，再做重叠去重。
+     * 相邻块的扩展区会重复覆盖同一批窗口，重叠去重会把它们一起合并掉，
+     * 所以分块结果与整段搜索一致（不再只按坐标精确去重）。 */
+    std::sort(merged.begin(), merged.end(), rowPreferred);
+    if (!dedupeOverlappingWindows(merged, control))
+        return {};
+
     std::vector<FlowerRow> unique;
     unique.reserve(std::min(merged.size(), kMaxMergedRows));
-    for (FlowerRow &row : merged)
+    for (OutRow &row : merged)
     {
-        if (!seen.insert(flowerWindowKey(row)).second)
-            continue;
         unique.push_back(std::move(row));
         if (unique.size() >= kMaxMergedRows)
             break;

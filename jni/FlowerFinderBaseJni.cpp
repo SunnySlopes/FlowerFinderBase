@@ -50,6 +50,9 @@ struct Progress {
     std::atomic_int stage{0};          // 1 while the post-screen merge/cluster tail runs
     std::atomic_int auxCurrent{0};   // phase-2 progress, in candidate hits
     std::atomic_int auxTotal{0};
+    std::atomic_int tileCurrent{0};  // completed tiles of a tiled search
+    std::atomic_int tileTotal{0};    // total tiles (0 = single-block search)
+    std::atomic_bool deferPause{false};
     std::atomic_bool try_pause{false};
     std::atomic_bool try_stop{false};
 };
@@ -67,6 +70,9 @@ static void resetProgressState()
     progress.stage.store(0);
     progress.auxCurrent.store(0);
     progress.auxTotal.store(0);
+    progress.tileCurrent.store(0);
+    progress.tileTotal.store(0);
+    progress.deferPause.store(false);
     progress.try_pause.store(false);
     progress.try_stop.store(false);
 }
@@ -97,7 +103,9 @@ JNIEXPORT jobjectArray JNICALL Java_com_sunnyslopes_flowerfarmfinder_FlowerFarmF
         &progress.current, &progress.total,
         &progress.overallCurrent, &progress.overallTotal,
         &progress.stage,
-        &progress.auxCurrent, &progress.auxTotal
+        &progress.auxCurrent, &progress.auxTotal,
+        &progress.tileCurrent, &progress.tileTotal,
+        &progress.deferPause
     };
     unsigned hw = std::thread::hardware_concurrency();
     int maxThreads = hw > 0 ? (int) hw : 1;
@@ -157,6 +165,9 @@ JNIEXPORT jintArray JNICALL Java_com_sunnyslopes_flowerfarmfinder_FlowerFarmFind
     if (phase == 1 && progress.stage.load() != 0)
         phase = 2;
     int cur = progress.current.load();
+    /* The engine may tick slightly past a preset total; never report past 100%. */
+    if (tot > 0 && cur > tot)
+        cur = tot;
     int status = 1;
     if (phase == 3)
         status = cur >= tot ? 2 : 1;
@@ -165,22 +176,41 @@ JNIEXPORT jintArray JNICALL Java_com_sunnyslopes_flowerfarmfinder_FlowerFarmFind
     if (overallTot <= 0) {
         overallCur = cur;
         overallTot = tot;
+    } else if (overallCur > overallTot) {
+        overallCur = overallTot;
     }
 
-    /* Indices 10/11 carry the phase-2 merge progress (candidate hits).  Older
-     * hosts read only the first 10 entries. */
-    jint data[12] = {
+    int auxCur = progress.auxCurrent.load();
+    int auxTot = progress.auxTotal.load();
+    if (auxTot > 0 && auxCur > auxTot)
+        auxCur = auxTot;
+
+    /* Tile progress of a tiled (large-range) search; tileTotal == 0 means the
+     * search ran as a single block. */
+    int tileTot = progress.tileTotal.load();
+    int tileCur = progress.tileCurrent.load();
+    if (tileTot > 0) {
+        if (tileCur > tileTot)
+            tileCur = tileTot;
+    } else {
+        tileCur = 0;
+    }
+
+    /* Indices 10/11 carry the phase-2 merge progress (candidate hits); 12/13/14
+     * carry tile progress.  Older hosts read only the first 10 entries. */
+    jint data[15] = {
         cur, tot, phase, status,
         progress.try_pause.load() ? 1 : 0,
         progress.try_stop.load() ? 1 : 0,
-        progress.current.load(), progress.total.load(),
+        cur, tot,
         overallCur, overallTot,
-        progress.auxCurrent.load(), progress.auxTotal.load()
+        auxCur, auxTot,
+        tileTot > 0 ? 1 : 0, tileCur, tileTot
     };
-    jintArray arr = env->NewIntArray(12);
+    jintArray arr = env->NewIntArray(15);
     if (!arr)
         return nullptr;
-    env->SetIntArrayRegion(arr, 0, 12, data);
+    env->SetIntArrayRegion(arr, 0, 15, data);
     return arr;
 }
 

@@ -78,6 +78,9 @@ struct Progress {
     std::atomic_int stage{0};
     std::atomic_int auxCurrent{0};
     std::atomic_int auxTotal{0};
+    std::atomic_int tileCurrent{0};
+    std::atomic_int tileTotal{0};
+    std::atomic_bool deferPause{false};
     std::atomic_bool tryPause{false};
     std::atomic_bool tryStop{false};
 };
@@ -400,7 +403,10 @@ int main(int argc, char **argv)
         &progress.overallTotal,
         &progress.stage,
         &progress.auxCurrent,
-        &progress.auxTotal};
+        &progress.auxTotal,
+        &progress.tileCurrent,
+        &progress.tileTotal,
+        &progress.deferPause};
 
     FlowerSearchOptions options{};
     options.requireBothWildflowers = args.bothWildflowers;
@@ -434,8 +440,15 @@ int main(int argc, char **argv)
                 if (total <= 0)
                     continue;
                 const double percent = current * 100.0 / total;
-                std::fprintf(stderr, "\r[%-14s] %d/%d (%5.1f%%)   ",
-                             phaseName(phase), current, total, percent);
+                const int tileTotal = progress.tileTotal.load();
+                if (tileTotal > 0) {
+                    const int tileCurrent = progress.tileCurrent.load();
+                    std::fprintf(stderr, "\r[tile %d/%d][%-14s] %d/%d (%5.1f%%)   ",
+                                 tileCurrent, tileTotal, phaseName(phase), current, total, percent);
+                } else {
+                    std::fprintf(stderr, "\r[%-14s] %d/%d (%5.1f%%)   ",
+                                 phaseName(phase), current, total, percent);
+                }
                 std::fflush(stderr);
             }
         });

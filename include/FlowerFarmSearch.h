@@ -38,6 +38,21 @@ struct FlowerSearchControl {
      */
     std::atomic_int *auxCurrent = nullptr;
     std::atomic_int *auxTotal = nullptr;
+    /**
+     * Tile-level progress for a tiled (large-range) search.  `tileTotal > 0`
+     * means the search runs in tiles and `tileCurrent` counts completed tiles;
+     * the host shows the overall bar from these two and keeps the per-phase
+     * counters for the text of the tile that is currently running.  Optional;
+     * nullptr disables it.
+     */
+    std::atomic_int *tileCurrent = nullptr;
+    std::atomic_int *tileTotal = nullptr;
+    /**
+     * While this flag is set, pause requests are deferred: the running tile is
+     * finished first and the search then blocks at the tile boundary.  Stop is
+     * never deferred.  Optional; nullptr keeps pauses immediate.
+     */
+    std::atomic_bool *deferPause = nullptr;
 };
 
 /**
