@@ -16,6 +16,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -28,6 +29,36 @@ constexpr double kBg = 0.09;
 constexpr int kBiomeY = 256;
 constexpr int kNetherY = 64;
 constexpr int kPaleDist = 64;
+
+/* ---------------------------------------------------------------------------
+ * 大范围分块（内存上限）
+ *
+ * CTS 的粗网格（engine.c 的 el/hh）是按**整个搜索矩形**一次性分配的：面积
+ * 翻倍，两块 float 网格就翻倍。全图级别（3.6e15 格）会吃掉数 GB，在浏览器
+ * / WASM 里直接 OOM。
+ *
+ * 这里把请求矩形切成边长 <= kTileSpan 的块，逐块跑完整流程（筛选 + 校验），
+ * 最后合并去重。每块外扩 kTileOverlap 格（= 最大窗口边长），保证跨块边界的
+ * 窗口至少在某一块里能完整出现；重叠部分按 (cx,cz,sideX,sideZ) 去重。
+ *
+ * 代价：重叠区重复计算；262144 的块 + 1024 重叠约 1.6%。
+ * ------------------------------------------------------------------------- */
+constexpr int64_t kTileSpan = 262144;
+constexpr int kTileOverlap = 1024; /* MAX_WINDOW */
+
+/* 桌面端可以按内存换速度：FLOWER_TILE_SPAN=524288 之类会让块数变少、每块
+ * 的固定开销摊薄（代价是峰值内存按面积线性上升）。默认值保持网页端安全。 */
+static int64_t tileSpanFromEnv()
+{
+    const char *text = std::getenv("FLOWER_TILE_SPAN");
+    if (!text || !*text)
+        return kTileSpan;
+    char *end = nullptr;
+    const long long value = std::strtoll(text, &end, 10);
+    if (end == text || value < 65536 || value > 60000001LL)
+        return kTileSpan;
+    return (int64_t) value;
+}
 constexpr int kFlowerAreaMin = 2000;
 
 int stopRequested(void *user)
@@ -646,7 +677,41 @@ bool considerHit(const Climate &climate, const Generator &overworld, const Gener
 
 } // namespace
 
-std::vector<FlowerRow> runFlowerFarmSearchRows(
+/* ---------------------------------------------------------------------------
+ * 搜索上下文：气候/生成器/花噪声明一次，所有分块共用。
+ *
+ * 这三样初始化（climate_init / setupGenerator / initFlowerNoise）各自都要建
+ * 噪声表，单次约 1.4 s。分块搜索时如果每块重建，64 块就白烧近 90 秒。
+ * 它们只依赖 (seed, mc)，与搜索矩形无关，所以提到分块外层复用。
+ * ------------------------------------------------------------------------- */
+struct FlowerSearchContext {
+    Climate climate{};
+    Generator overworld{};
+    Generator nether{};
+    FlowerNoise flowers{};
+    VersionRules rules{};
+};
+
+static void prepareFlowerContext(int mc, uint64_t seed, FlowerSearchContext &ctx)
+{
+    ctx.rules = rulesForMc(mc);
+    climate_init(&ctx.climate, seed, 0);
+    if (mc != MC_NEWEST)
+    {
+        initBiomeNoise(&ctx.climate.bn, mc);
+        setBiomeSeed(&ctx.climate.bn, seed, 0);
+    }
+    setupGenerator(&ctx.overworld, mc, 0);
+    applySeed(&ctx.overworld, DIM_OVERWORLD, seed);
+    setupGenerator(&ctx.nether, mc, 0);
+    applySeed(&ctx.nether, DIM_NETHER, seed);
+    initFlowerNoise(ctx.flowers);
+}
+
+/* 单块区域：完整跑一遍筛选 + 校验。分块、合并、去重由外层
+ * runFlowerFarmSearchRows() 负责；本函数不关心请求面积有多大。 */
+static std::vector<FlowerRow> runFlowerFarmSearchRegion(
+    FlowerSearchContext &ctx,
     uint64_t seed,
     int mc,
     int minX,
@@ -673,7 +738,7 @@ std::vector<FlowerRow> runFlowerFarmSearchRows(
     if (threads <= 0 || threads > maxThreads)
         threads = maxThreads;
 
-    const VersionRules rules = rulesForMc(mc);
+    const VersionRules &rules = ctx.rules;
 
     const bool square = squareOnly || shortSide == longSide;
     const int windowX = alignDown(longSide, square ? 32 : 8, square ? 64 : 8);
@@ -687,13 +752,7 @@ std::vector<FlowerRow> runFlowerFarmSearchRows(
     if (!pauseOk(control))
         return result;
 
-    Climate climate{};
-    climate_init(&climate, seed, 0);
-    if (mc != MC_NEWEST)
-    {
-        initBiomeNoise(&climate.bn, mc);
-        setBiomeSeed(&climate.bn, seed, 0);
-    }
+    Climate &climate = ctx.climate;
 
     ScanCfg cfg = makeCfg(windowX, windowZ, frameStep <= 4, rules.requirePale ? 0 : 1,
                           rules.clusterBlocks, threads);
@@ -751,15 +810,10 @@ std::vector<FlowerRow> runFlowerFarmSearchRows(
     setPhase(control, 3, phase3Total);
     setOverall(control, phase1Total, overallTotal);
 
-    Generator overworld{};
-    Generator nether{};
-    setupGenerator(&overworld, mc, 0);
-    applySeed(&overworld, DIM_OVERWORLD, seed);
-    setupGenerator(&nether, mc, 0);
-    applySeed(&nether, DIM_NETHER, seed);
+    Generator &overworld = ctx.overworld;
+    Generator &nether = ctx.nether;
 
-    FlowerNoise flowers;
-    initFlowerNoise(flowers);
+    FlowerNoise &flowers = ctx.flowers;
 
     /* Phase 3 is the expensive part: every candidate re-samples a full window
      * of biomes plus the flower-noise height extremes.  All inputs here are
@@ -883,6 +937,134 @@ std::vector<FlowerRow> runFlowerFarmSearchRows(
     setPhaseCurrent(control, phase3Total);
     setOverall(control, overallTotal, overallTotal);
     return result;
+}
+
+/* 结果合并用的偏好序：与 rowPreferred 保持同一主次（樱花优先 → 离原点近 →
+ * 坐标稳定），只是这里只有公开的 FlowerRow 字段可用。 */
+static bool flowerRowPreferred(const FlowerRow &a, const FlowerRow &b)
+{
+    const bool pa = a.bonus.find("pink_petals") != std::string::npos;
+    const bool pb = b.bonus.find("pink_petals") != std::string::npos;
+    if (pa != pb)
+        return pa;
+    const int64_t da = (int64_t) a.cx * a.cx + (int64_t) a.cz * a.cz;
+    const int64_t db = (int64_t) b.cx * b.cx + (int64_t) b.cz * b.cz;
+    if (da != db)
+        return da < db;
+    if (a.cx != b.cx)
+        return a.cx < b.cx;
+    if (a.cz != b.cz)
+        return a.cz < b.cz;
+    if (a.sideX != b.sideX)
+        return a.sideX < b.sideX;
+    return a.sideZ < b.sideZ;
+}
+
+/* 同一窗口坐标在相邻块的扩展区里会各出现一次，按 (cx,cz,sideX,sideZ) 去重。 */
+static uint64_t flowerWindowKey(const FlowerRow &row)
+{
+    uint64_t h = (uint64_t)(uint32_t) row.cx;
+    h = h * 0x9E3779B97F4A7C15ull ^ (uint64_t)(uint32_t) row.cz;
+    h = h * 0x9E3779B97F4A7C15ull ^ (uint64_t)(uint32_t) row.sideX;
+    h = h * 0x9E3779B97F4A7C15ull ^ (uint64_t)(uint32_t) row.sideZ;
+    /* splitmix64 末轮，保证低位也混合。 */
+    h ^= h >> 30;
+    h *= 0xBF58476D1CE4E5B9ull;
+    h ^= h >> 27;
+    h *= 0x94D049BB133111EBull;
+    h ^= h >> 31;
+    return h;
+}
+
+/* 合并后的上限：宿主最终只保留前 1000 条，这里留足余量即可，避免极端情况下
+ * 分块结果把内存重新撑大。 */
+constexpr size_t kMaxMergedRows = 20000;
+
+std::vector<FlowerRow> runFlowerFarmSearchRows(
+    uint64_t seed,
+    int mc,
+    int minX,
+    int minZ,
+    int maxX,
+    int maxZ,
+    int longSide,
+    int shortSide,
+    bool squareOnly,
+    int frameStep,
+    int threads,
+    FlowerSearchControl &control,
+    const FlowerSearchOptions &options)
+{
+    if (maxX < minX || maxZ < minZ)
+        return {};
+
+    /* 气候/生成器/花噪声明一次，分块与单块共用。 */
+    const int effectiveMc = (mc == MC_UNDEF) ? MC_NEWEST : mc;
+    FlowerSearchContext ctx;
+    prepareFlowerContext(effectiveMc, seed, ctx);
+
+    const int64_t tileSpan = tileSpanFromEnv();
+    const int64_t spanX = (int64_t) maxX - minX + 1;
+    const int64_t spanZ = (int64_t) maxZ - minZ + 1;
+    if (spanX <= tileSpan && spanZ <= tileSpan)
+        return runFlowerFarmSearchRegion(ctx, seed, effectiveMc, minX, minZ, maxX, maxZ,
+                                         longSide, shortSide, squareOnly,
+                                         frameStep, threads, control, options);
+
+    /* 窗口边长决定块间重叠：跨块边界的窗口必须在某一块里完整出现。 */
+    const bool square = squareOnly || shortSide == longSide;
+    const int windowX = alignDown(longSide, square ? 32 : 8, square ? 64 : 8);
+    const int windowZ = square ? windowX : alignDown(shortSide, 8, 8);
+    if (windowX <= 0 || windowZ <= 0)
+        return {};
+    const int overlap = std::max(1, std::min(kTileOverlap, std::max(windowX, windowZ)));
+
+    const int64_t tileCount = std::max<int64_t>(1, ((spanX + tileSpan - 1) / tileSpan) *
+                                                       ((spanZ + tileSpan - 1) / tileSpan));
+    std::vector<FlowerRow> merged;
+    int64_t done = 0;
+    for (int64_t tx = minX; tx <= maxX; tx += tileSpan)
+    {
+        for (int64_t tz = minZ; tz <= maxZ; tz += tileSpan)
+        {
+            const int64_t x0 = std::max<int64_t>(minX, tx - overlap);
+            const int64_t z0 = std::max<int64_t>(minZ, tz - overlap);
+            const int64_t x1 = std::min<int64_t>(maxX, tx + tileSpan - 1 + overlap);
+            const int64_t z1 = std::min<int64_t>(maxZ, tz + tileSpan - 1 + overlap);
+            if (x1 - x0 + 1 < windowX || z1 - z0 + 1 < windowZ)
+                continue; /* 太小，装不下一个窗口 */
+            if (!pauseOk(control))
+                return merged; /* 用户暂停/停止：返回已算出的部分 */
+
+            std::vector<FlowerRow> part = runFlowerFarmSearchRegion(
+                ctx, seed, effectiveMc, (int) x0, (int) z0, (int) x1, (int) z1, longSide,
+                shortSide, squareOnly, frameStep, threads, control, options);
+            merged.insert(merged.end(), std::make_move_iterator(part.begin()),
+                          std::make_move_iterator(part.end()));
+            ++done;
+            /* 分块模式下总进度按"完成的块"推进；块内仍然有各自的细进度。 */
+            setOverall(control, (int) std::min<int64_t>(done, tileCount),
+                       (int) std::min<int64_t>(tileCount, INT_MAX));
+        }
+    }
+
+    if (merged.empty())
+        return merged;
+
+    std::sort(merged.begin(), merged.end(), flowerRowPreferred);
+    std::unordered_set<uint64_t> seen;
+    seen.reserve(merged.size());
+    std::vector<FlowerRow> unique;
+    unique.reserve(std::min(merged.size(), kMaxMergedRows));
+    for (FlowerRow &row : merged)
+    {
+        if (!seen.insert(flowerWindowKey(row)).second)
+            continue;
+        unique.push_back(std::move(row));
+        if (unique.size() >= kMaxMergedRows)
+            break;
+    }
+    return unique;
 }
 
 std::vector<std::string> runFlowerFarmSearch(
