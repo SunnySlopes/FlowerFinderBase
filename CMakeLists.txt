@@ -58,8 +58,12 @@ set(FFB_CUBIOMES_SOURCES
 
 set(FFB_CTS_SOURCES
     "${FFB_ROOT}/cts/climate.c"
+    "${FFB_ROOT}/cts/climate_simd.c"
     "${FFB_ROOT}/cts/biome.c"
-    "${FFB_ROOT}/cts/engine.c")
+    "${FFB_ROOT}/cts/engine.c"
+    "${FFB_ROOT}/cts/parallel.cpp")
+
+find_package(Threads REQUIRED)
 
 add_library(flower_core STATIC
     "${FFB_ROOT}/src/FlowerFarmSearch.cpp"
@@ -72,6 +76,7 @@ target_include_directories(flower_core
         "${FFB_ROOT}/include"
         "${FFB_ROOT}"
         "${FFB_CUBIOMES_DIR}"
+        "${FFB_CUBIOMES_DIR}/.."
     PRIVATE
         "${FFB_ROOT}/cts")
 target_compile_definitions(flower_core PRIVATE _WIN32)
@@ -79,7 +84,7 @@ target_compile_definitions(flower_core PRIVATE _WIN32)
 # 逐位一致的硬性要求：必须 -ffp-contract=off，绝不可加 -ffast-math
 # （与 All-In-One Finder 的 native 构建、SlimeFinderBase 保持一致）。
 set(FFB_FAST_FLAGS
-    -O3 -DNDEBUG -fwrapv -ffp-contract=off -fno-lto -mpopcnt -fopenmp)
+    -O3 -DNDEBUG -fwrapv -ffp-contract=off -fno-lto -mpopcnt)
 
 target_compile_options(flower_core PRIVATE ${FFB_FAST_FLAGS})
 
@@ -102,8 +107,8 @@ if (MINGW OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   endif()
 endif()
 
-# OpenMP 运行时由每个 final target 自己链接（静态库不带链接依赖）。
-target_link_options(flower_core INTERFACE -fopenmp)
+# std::thread (winpthreads on MSYS2, pthreads under Emscripten -pthread).
+target_link_libraries(flower_core INTERFACE Threads::Threads)
 
 # --- 独立命令行 -------------------------------------------------------------
 if (FFB_BUILD_CLI)

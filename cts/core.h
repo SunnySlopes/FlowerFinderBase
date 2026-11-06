@@ -59,7 +59,7 @@ typedef struct {
     double pm_e, pm_h;   /* perimeter pre-check margins */
     int full_verify;     /* 1 = full 4-block verify; 0 = accept the perimeter */
     int no_pale;         /* 1 = coarse E/H only needs swamp hi-E + flower lo-H */
-    int threads;         /* explicit OpenMP team size (0 = library default) */
+    int threads;         /* explicit worker count (0 = library default) */
     int max_threads;     /* machine limit; fixes the tile grid independent of threads */
 } ScanCfg;
 
@@ -123,6 +123,16 @@ int *biome_map(const Generator *g, int x, int z, int w, int h, int y, int scale)
 void biome_cache_stats(uint64_t *hits, uint64_t *misses);
 void climate_low_h(const Climate *c, double qx, double qz,
                    double *e_low, double *h);
+
+/* 4-wide variants of climate_sample()/climate_low_h(): qx[0..3] share one qz
+ * and are evaluated together.  Bit-identical to four scalar calls; the
+ * implementation falls back to scalar code on hosts without AVX2 (including
+ * Emscripten) or when shift != 0. */
+void climate_sample4(const Climate *c, const double qx[4], double qz, int shift,
+                     double e[4], double h[4]);
+void climate_low_h4(const Climate *c, const double qx[4], double qz,
+                    double e[4], double h[4]);
+int cts_climate_simd_supported(void);
 double climate_e(const Climate *c, double qx, double qz, int shift);
 double climate_e_low(const Climate *c, double qx, double qz);
 double climate_e_high(const Climate *c, double qx, double qz);
@@ -151,7 +161,7 @@ int screen_area(const Climate *c, int64_t bx0, int64_t bz0, int64_t bx1, int64_t
                 double bg, Hit **hits, int *nhits, ScanStats *st);
 
 /* Single-seed parallelism: split the area into overlapping tiles, screen
- * them in parallel, then merge/cluster.  threads <= 0 uses OMP max. */
+ * them in parallel, then merge/cluster.  threads <= 0 uses the CPU count. */
 int screen_area_parallel(const Climate *c, int64_t bx0, int64_t bz0,
                          int64_t bx1, int64_t bz1, const ScanCfg *cfg,
                          int64_t step_l0, double m_e, double m_h, double bg,

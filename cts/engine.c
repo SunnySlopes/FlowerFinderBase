@@ -5,9 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _OPENMP
-#include <omp.h>
-#endif
+#include "parallel.h"
 
 static int *prog_cur;
 static int *prog_tot;
@@ -104,7 +102,7 @@ void cts_bind_control(CtsControlFn stopped, CtsControlFn checkpoint, void *user)
     ctl_user = user;
 }
 
-/* Cheap non-blocking check, safe in OpenMP loops. */
+/* Cheap non-blocking check, safe in worker loops. */
 static int cts_stopped(void)
 {
     return ctl_stopped_fn && ctl_stopped_fn(ctl_user);
@@ -209,8 +207,9 @@ static void slide1d(const float *src, int n, int win, int *dq,
 }
 
 /* out_min/out_max are (w-winx+1) * (h-winz+1), row-major. */
-static void slide2d_xy(const float *f, int w, int h, int winx, int winz,
-                       float *out_min, float *out_max)
+static void slide2d_xy_stride(const float *f, int w, int h, int stride,
+                              int winx, int winz,
+                              float *out_min, float *out_max)
 {
     int ow = w - winx + 1, oh = h - winz + 1;
     int x, z, dqn = w > h ? w : h;
@@ -231,7 +230,7 @@ static void slide2d_xy(const float *f, int w, int h, int winx, int winz,
         return;
     }
     for (z = 0; z < h; z++)
-        slide1d(f + (size_t)z * w, w, winx, dq,
+        slide1d(f + (size_t)z * stride, w, winx, dq,
                 tm + (size_t)z * ow, tx + (size_t)z * ow);
     for (x = 0; x < ow; x++) {
         for (z = 0; z < h; z++) {
@@ -246,6 +245,12 @@ static void slide2d_xy(const float *f, int w, int h, int winx, int winz,
             out_max[(size_t)z * ow + x] = ox[z];
     }
     free(dq); free(tm); free(tx); free(cm); free(cx); free(om); free(ox);
+}
+
+static void slide2d_xy(const float *f, int w, int h, int winx, int winz,
+                       float *out_min, float *out_max)
+{
+    slide2d_xy_stride(f, w, h, w, winx, winz, out_min, out_max);
 }
 
 /* out_min/out_max are (w-win+1) * (h-win+1), row-major. */
@@ -445,6 +450,40 @@ static int try_candidate(const Climate *c, const ScanCfg *cfg,
     }
 }
 
+typedef struct {
+    const Climate *c;
+    int qx0, qz0, s0, gnx;
+    float *el, *hh;
+} SquareFillCtx;
+
+static void square_fill_row(void *ptr, int j)
+{
+    SquareFillCtx *f = (SquareFillCtx *)ptr;
+    int ii = 0;
+    if (cts_checkpoint()) return;
+    for (; ii + 4 <= f->gnx; ii += 4) {
+        double qx[4], e[4], h[4];
+        double qz = (double)(f->qz0 + j * f->s0);
+        int k;
+        for (k = 0; k < 4; ++k)
+            qx[k] = (double)(f->qx0 + (ii + k) * f->s0);
+        climate_low_h4(f->c, qx, qz, e, h);
+        for (k = 0; k < 4; ++k) {
+            f->el[(size_t)j * f->gnx + ii + k] = (float)e[k];
+            f->hh[(size_t)j * f->gnx + ii + k] = (float)h[k];
+        }
+    }
+    for (; ii < f->gnx; ++ii) {
+        double qx = (double)(f->qx0 + ii * f->s0);
+        double qz = (double)(f->qz0 + j * f->s0);
+        double e, h;
+        climate_low_h(f->c, qx, qz, &e, &h);
+        f->el[(size_t)j * f->gnx + ii] = (float)e;
+        f->hh[(size_t)j * f->gnx + ii] = (float)h;
+    }
+    progress_tick();
+}
+
 static int screen_area_square(const Climate *c, int64_t bx0, int64_t bz0, int64_t bx1, int64_t bz1,
                 const ScanCfg *cfg, int64_t step_l0, double m_e, double m_h,
                 double bg, Hit **hits, int *nhits, ScanStats *st)
@@ -486,19 +525,9 @@ static int screen_area_square(const Climate *c, int64_t bx0, int64_t bz0, int64_
         /* The final +1 is the merge/cluster unit, ticked after the scan. */
         progress_expect(clamp_progress_total((int64_t)gny + windows + 1));
     }
-#pragma omp parallel for schedule(static) num_threads(cfg->threads) if(!omp_in_parallel())
-    for (j = 0; j < gny; j++) {
-        int ii;
-        if (cts_checkpoint()) continue;
-        for (ii = 0; ii < gnx; ii++) {
-            double qx = (double)(qx0 + ii * s0);
-            double qz = (double)(qz0 + j * s0);
-            double e, h;
-            climate_low_h(c, qx, qz, &e, &h);
-            el[(size_t)j * gnx + ii] = (float)e;
-            hh[(size_t)j * gnx + ii] = (float)h;
-        }
-        progress_tick();
+    {
+        SquareFillCtx fctx = {c, qx0, qz0, s0, gnx, el, hh};
+        cts_parallel_for(gny, cfg->threads, 0, square_fill_row, &fctx);
     }
     if (cts_stopped()) stopped = 1;
     if (stopped) goto done;
@@ -810,7 +839,7 @@ done:
 }
 
 static int eval_rect_orientation(const Climate *c, const ScanCfg *cfg,
-                                  float *ef, float *hf, int gw, int gh,
+                                  float *ef, float *hf, int gw, int gh, int stride,
                                   int qx0, int qz0, int cg,
                                   int winx, int winz, int stepq,
                                   int qx1, int qz1, double m_e, double m_h,
@@ -833,8 +862,8 @@ static int eval_rect_orientation(const Climate *c, const ScanCfg *cfg,
         free(mne); free(mxe); free(mnh); free(mxh);
         return 0;
     }
-    slide2d_xy(ef, gw, gh, cw, ch, mne, mxe);
-    slide2d_xy(hf, gw, gh, cw, ch, mnh, mxh);
+    slide2d_xy_stride(ef, gw, gh, stride, cw, ch, mne, mxe);
+    slide2d_xy_stride(hf, gw, gh, stride, cw, ch, mnh, mxh);
     for (bz = qz0; bz + winz - 1 <= qz1; bz += stepq) {
         iz = (bz - qz0) / cg;
         if (iz >= oh) break;
@@ -892,14 +921,50 @@ static int rect_coarse_cell(const ScanCfg *cfg, int winx, int winz)
     return 2;
 }
 
-int screen_area_rect_both(const Climate *c, int64_t bx0, int64_t bz0,
+typedef struct {
+    const Climate *c;
+    int qx0, qz0, cg, gw;
+    float *ef, *hf;
+} RectFillCtx;
+
+static void rect_fill_row(void *ptr, int iz)
+{
+    RectFillCtx *f = (RectFillCtx *)ptr;
+    int xx = 0;
+    const double qz = (double)(f->qz0 + iz * f->cg);
+    if (cts_checkpoint()) return;
+    for (; xx + 4 <= f->gw; xx += 4) {
+        double qx[4], e[4], h[4];
+        int k;
+        for (k = 0; k < 4; ++k)
+            qx[k] = (double)(f->qx0 + (xx + k) * f->cg);
+        climate_sample4(f->c, qx, qz, 0, e, h);
+        for (k = 0; k < 4; ++k) {
+            f->ef[(size_t)iz * f->gw + xx + k] = (float)e[k];
+            f->hf[(size_t)iz * f->gw + xx + k] = (float)h[k];
+        }
+    }
+    for (; xx < f->gw; ++xx) {
+        double e, h;
+        climate_sample(f->c, (double)(f->qx0 + xx * f->cg), qz, 0, &e, &h);
+        f->ef[(size_t)iz * f->gw + xx] = (float)e;
+        f->hf[(size_t)iz * f->gw + xx] = (float)h;
+    }
+    progress_tick();
+}
+
+static int screen_area_rect_both_impl(const Climate *c, int64_t bx0, int64_t bz0,
                           int64_t bx1, int64_t bz1, const ScanCfg *cfg,
                           int64_t step_l0, double m_e, double m_h,
+                          const float *shared_ef, const float *shared_hf,
+                          int shared_gw, int shared_gh, int shared_qx0,
+                          int shared_qz0, int shared_cg,
                           Hit **hits_x, int *nhits_x,
                           Hit **hits_z, int *nhits_z, ScanStats *st)
 {
     int qx0, qx1, qz0, qz1, winx, winz, gw, gh, iz, cg;
     float *ef = NULL, *hf = NULL;
+    int stride = 0, own_field = 1;
     int capx = 0, capz = 0, stepq;
     int stopped = 0;
     double t0 = now_sec();
@@ -915,46 +980,58 @@ int screen_area_rect_both(const Climate *c, int64_t bx0, int64_t bz0,
     cg = rect_coarse_cell(cfg, winx, winz);
     gw = (qx1 - qx0) / cg + 3;
     gh = (qz1 - qz0) / cg + 3;
-    ef = (float *)malloc((size_t)gw * gh * sizeof(float));
-    hf = (float *)malloc((size_t)gw * gh * sizeof(float));
-    if (!ef || !hf) { free(ef); free(hf); return 0; }
-    progress_expect(clamp_progress_total(
-        (int64_t)rect_both_work(bx0, bz0, bx1, bz1, cfg, step_l0) + 1));
-    /* The coarse field rows are phase-1 units: counting them here means the
-     * phase-1 bar starts at 0 and rises from the first row, with no separate
-     * fill phase whose end would depend on the slowest tile.  There are only a
-     * few hundred rows per tile, so a plain tick per row is cheap and keeps the
-     * bar moving while the field is built. */
-#pragma omp parallel for schedule(static) num_threads(cfg->threads) if(!omp_in_parallel())
-    for (iz = 0; iz < gh; iz++) {
-        int xx;
-        if (cts_checkpoint()) continue;
-        for (xx = 0; xx < gw; xx++) {
-            double e, h;
-            climate_sample(c, (double)(qx0 + xx * cg),
-                           (double)(qz0 + iz * cg), 0, &e, &h);
-            ef[(size_t)iz * gw + xx] = (float)e;
-            hf[(size_t)iz * gw + xx] = (float)h;
+
+    /* Reuse the caller's coarse field when it covers this tile on the same
+     * grid.  Values are identical because they are sampled at the same world
+     * coordinates, so this only removes duplicate work, never changes results. */
+    if (shared_ef && shared_hf && shared_cg == cg) {
+        const int offx = (qx0 - shared_qx0) / cg;
+        const int offz = (qz0 - shared_qz0) / cg;
+        if (offx >= 0 && offz >= 0 &&
+            (qx0 - shared_qx0) % cg == 0 && (qz0 - shared_qz0) % cg == 0 &&
+            offx + gw <= shared_gw && offz + gh <= shared_gh) {
+            stride = shared_gw;
+            ef = (float *)shared_ef + (size_t)offz * shared_gw + offx;
+            hf = (float *)shared_hf + (size_t)offz * shared_gw + offx;
+            own_field = 0;
         }
-        progress_tick();
     }
-    if (cts_stopped()) stopped = 1;
-    if (stopped) goto done;
-    st->t_fill = now_sec() - t0;
-    st->points += (int64_t)gw * gh;
+
+    if (own_field) {
+        stride = gw;
+        ef = (float *)malloc((size_t)gw * gh * sizeof(float));
+        hf = (float *)malloc((size_t)gw * gh * sizeof(float));
+        if (!ef || !hf) { free(ef); free(hf); return 0; }
+        progress_expect(clamp_progress_total(
+            (int64_t)rect_both_work(bx0, bz0, bx1, bz1, cfg, step_l0) + 1));
+        /* The coarse field rows are phase-1 units: counting them here means the
+         * phase-1 bar starts at 0 and rises from the first row, with no separate
+         * fill phase whose end would depend on the slowest tile.  There are only a
+         * few hundred rows per tile, so a plain tick per row is cheap and keeps the
+         * bar moving while the field is built. */
+        {
+            RectFillCtx fctx = {c, qx0, qz0, cg, gw, ef, hf};
+            cts_parallel_for(gh, cfg->threads, 0, rect_fill_row, &fctx);
+        }
+        if (cts_stopped()) stopped = 1;
+        if (stopped) goto done;
+        st->t_fill = now_sec() - t0;
+        st->points += (int64_t)gw * gh;
+    }
+
     stepq = (int)(step_l0 / 4 / cg) * cg;
     if (stepq < cg) stepq = cg;
-    if (!eval_rect_orientation(c, cfg, ef, hf, gw, gh, qx0, qz0, cg,
+    if (!eval_rect_orientation(c, cfg, ef, hf, gw, gh, stride, qx0, qz0, cg,
                                winx, winz, stepq, qx1, qz1, m_e, m_h,
                                hits_x, nhits_x, &capx, st) ||
-        !eval_rect_orientation(c, cfg, ef, hf, gw, gh, qx0, qz0, cg,
+        !eval_rect_orientation(c, cfg, ef, hf, gw, gh, stride, qx0, qz0, cg,
                                winz, winx, stepq, qx1, qz1, m_e, m_h,
                                hits_z, nhits_z, &capz, st)) {
         stopped = 1;
         goto done;
     }
 done:
-    free(ef); free(hf);
+    if (own_field) { free(ef); free(hf); }
     if (!stopped && cfg->cluster > 0) {
         int merge_start = *nhits_x + *nhits_z;
         if (tile_depth == 0)
@@ -976,6 +1053,17 @@ done:
     st->hits = *nhits_x + *nhits_z;
     st->t_total = now_sec() - t0;
     return stopped ? 0 : 1;
+}
+
+int screen_area_rect_both(const Climate *c, int64_t bx0, int64_t bz0,
+                          int64_t bx1, int64_t bz1, const ScanCfg *cfg,
+                          int64_t step_l0, double m_e, double m_h,
+                          Hit **hits_x, int *nhits_x,
+                          Hit **hits_z, int *nhits_z, ScanStats *st)
+{
+    return screen_area_rect_both_impl(c, bx0, bz0, bx1, bz1, cfg, step_l0, m_e, m_h,
+                                      NULL, NULL, 0, 0, 0, 0, 0,
+                                      hits_x, nhits_x, hits_z, nhits_z, st);
 }
 
 static int64_t align_tile_start(int64_t block, int64_t origin, int64_t step_blocks)
@@ -1106,6 +1194,44 @@ static void preset_tile_rows(int ntx, int ntz, int64_t bx0, int64_t bz0, int64_t
     }
 }
 
+typedef struct {
+    const Climate *c;
+    const ScanCfg *cfg;
+    int64_t bx0, bz0, bx1, bz1, tw, th, overlap, step_l0;
+    int ntx;
+    double m_e, m_h;
+    BothTile *tr;
+    const float *shared_ef, *shared_hf;
+    int shared_gw, shared_gh, shared_qx0, shared_qz0, shared_cg;
+} BothTileCtx;
+
+static void both_tile_task(void *ptr, int t)
+{
+    BothTileCtx *q = (BothTileCtx *)ptr;
+    int64_t xa, xb, za, zb;
+    int xx = t % q->ntx, zz = t / q->ntx;
+    xa = q->bx0 + (int64_t)xx * q->tw;
+    za = q->bz0 + (int64_t)zz * q->th;
+    xb = xa + q->tw; if (xb > q->bx1) xb = q->bx1;
+    zb = za + q->th; if (zb > q->bz1) zb = q->bz1;
+    if (xa >= xb || za >= zb) return;
+    if (cts_checkpoint()) return;
+    xa -= q->overlap; if (xa < q->bx0) xa = q->bx0;
+    za -= q->overlap; if (za < q->bz0) za = q->bz0;
+    xb += q->overlap; if (xb > q->bx1) xb = q->bx1;
+    zb += q->overlap; if (zb > q->bz1) zb = q->bz1;
+    xa = align_tile_start(xa, q->bx0, q->step_l0);
+    za = align_tile_start(za, q->bz0, q->step_l0);
+    ++tile_depth;
+    screen_area_rect_both_impl(q->c, xa, za, xb, zb, q->cfg, q->step_l0, q->m_e, q->m_h,
+                               q->shared_ef, q->shared_hf,
+                               q->shared_gw, q->shared_gh, q->shared_qx0,
+                               q->shared_qz0, q->shared_cg,
+                               &q->tr[t].hx, &q->tr[t].nx,
+                               &q->tr[t].hz, &q->tr[t].nz, &q->tr[t].st);
+    --tile_depth;
+}
+
 int screen_area_rect_both_parallel(const Climate *c, int64_t bx0, int64_t bz0,
                                    int64_t bx1, int64_t bz1, const ScanCfg *cfg,
                                    int64_t step_l0, double m_e, double m_h,
@@ -1118,19 +1244,20 @@ int screen_area_rect_both_parallel(const Climate *c, int64_t bx0, int64_t bz0,
     int ntx, ntz, tx, tz, t, i;
     int64_t tw, th, overlap;
     BothTile *tr;
+    float *shared_ef = NULL, *shared_hf = NULL;
+    int shared_gw = 0, shared_gh = 0, shared_qx0 = 0, shared_qz0 = 0, shared_cg = 0;
+    double shared_fill = 0.0;
     size_t totalx = 0, totalz = 0;
     Hit *ax = NULL, *az = NULL;
     double t0 = now_sec();
-#ifdef _OPENMP
-    if (threads <= 0) nt = omp_get_max_threads();
+    if (threads <= 0) nt = cts_cpu_count();
     {
-        int procs = omp_get_num_procs();
+        int procs = cts_cpu_count();
         if (procs > 0) {
             if (nt > procs) nt = procs;
             if (gridNt > procs) gridNt = procs;
         }
     }
-#endif
     if (nt < 1) nt = 1;
     if (gridNt < 1) gridNt = 1;
     if (bx1 - bx0 < 2 * (int64_t)(cfg->window > cfg->window_z ? cfg->window : cfg->window_z) ||
@@ -1166,27 +1293,41 @@ int screen_area_rect_both_parallel(const Climate *c, int64_t bx0, int64_t bz0,
                                      m_e, m_h, hits_x, nhits_x,
                                      hits_z, nhits_z, st);
     preset_tile_rows(ntx, ntz, bx0, bz0, bx1, bz1, tw, th, overlap, step_l0, cfg, 0);
-#pragma omp parallel for schedule(dynamic,1) num_threads(nt)
-    for (t = 0; t < ntx * ntz; t++) {
-        int64_t xa, xb, za, zb;
-        int xx = t % ntx, zz = t / ntx;
-        xa = bx0 + (int64_t)xx * tw;
-        za = bz0 + (int64_t)zz * th;
-        xb = xa + tw; if (xb > bx1) xb = bx1;
-        zb = za + th; if (zb > bz1) zb = bz1;
-        if (xa >= xb || za >= zb) continue;
-        if (cts_checkpoint()) continue;
-        xa -= overlap; if (xa < bx0) xa = bx0;
-        za -= overlap; if (za < bz0) za = bz0;
-        xb += overlap; if (xb > bx1) xb = bx1;
-        zb += overlap; if (zb > bz1) zb = bz1;
-        xa = align_tile_start(xa, bx0, step_l0);
-        za = align_tile_start(za, bz0, step_l0);
-        ++tile_depth;
-        screen_area_rect_both(c, xa, za, xb, zb, cfg, step_l0, m_e, m_h,
-                              &tr[t].hx, &tr[t].nx,
-                              &tr[t].hz, &tr[t].nz, &tr[t].st);
-        --tile_depth;
+    {
+        /* Optional whole-region coarse field.  The tile halo otherwise rebuilds
+         * the same field cells once per tile; when the field fits into the cache
+         * budget we build it once and every tile reads its own window. */
+        const int winx = cfg->window / 4, winz = cfg->window_z / 4;
+        if (winx > 0 && winz > 0) {
+            const int cg = rect_coarse_cell(cfg, winx, winz);
+            const int qx0 = (int)floor_div4(bx0), qz0 = (int)floor_div4(bz0);
+            const int qx1 = (int)floor_div4(bx1 - 1), qz1 = (int)floor_div4(bz1 - 1);
+            const int gw = (qx1 - qx0) / cg + 3, gh = (qz1 - qz0) / cg + 3;
+            long long cap = 256LL << 20;
+            const char *env = getenv("FFB_FIELD_CACHE_MB");
+            if (env && atoi(env) > 0) cap = (long long)atoi(env) << 20;
+            const long long bytes = (long long)gw * gh * 2 * (long long)sizeof(float);
+            if (gw > 0 && gh > 0 && bytes <= cap) {
+                shared_ef = (float *)malloc((size_t)gw * gh * sizeof(float));
+                shared_hf = (float *)malloc((size_t)gw * gh * sizeof(float));
+                if (shared_ef && shared_hf) {
+                    const double ft0 = now_sec();
+                    RectFillCtx fctx = {c, qx0, qz0, cg, gw, shared_ef, shared_hf};
+                    cts_parallel_for(gh, cfg->threads, 0, rect_fill_row, &fctx);
+                    shared_fill = now_sec() - ft0;
+                    shared_gw = gw; shared_gh = gh;
+                    shared_qx0 = qx0; shared_qz0 = qz0; shared_cg = cg;
+                } else {
+                    free(shared_ef); free(shared_hf);
+                    shared_ef = shared_hf = NULL;
+                }
+            }
+        }
+        BothTileCtx tctx = {c, cfg, bx0, bz0, bx1, bz1, tw, th, overlap, step_l0,
+                            ntx, m_e, m_h, tr,
+                            shared_ef, shared_hf, shared_gw, shared_gh,
+                            shared_qx0, shared_qz0, shared_cg};
+        cts_parallel_for(ntx * ntz, nt, 1, both_tile_task, &tctx);
     }
     prog_preset = 0;
     if (cts_stopped())
@@ -1210,6 +1351,7 @@ int screen_area_rect_both_parallel(const Climate *c, int64_t bx0, int64_t bz0,
         free(ax); free(az);
         for (t = 0; t < ntx * ntz; t++) { free(tr[t].hx); free(tr[t].hz); }
         free(tr);
+        free(shared_ef); free(shared_hf);
         aux_progress_end();
         return screen_area_rect_both(c, bx0, bz0, bx1, bz1, cfg, step_l0,
                                      m_e, m_h, hits_x, nhits_x,
@@ -1242,7 +1384,12 @@ int screen_area_rect_both_parallel(const Climate *c, int64_t bx0, int64_t bz0,
         st->t_total += tr[t].st.t_total;
         free(tr[t].hx); free(tr[t].hz);
     }
+    if (shared_ef) {
+        st->points += (int64_t)shared_gw * shared_gh;
+        st->t_fill += shared_fill;
+    }
     free(tr);
+    free(shared_ef); free(shared_hf);
     *hits_x = ax; *nhits_x = (int)totalx;
     *hits_z = az; *nhits_z = (int)totalz;
     if (cfg->cluster > 0) {
@@ -1257,6 +1404,14 @@ int screen_area_rect_both_parallel(const Climate *c, int64_t bx0, int64_t bz0,
     progress_finish();
     progress_stage_tail(0);
     st->hits = *nhits_x + *nhits_z;
+    if (getenv("FFB_BENCH_STATS")) {
+        double wall = now_sec() - t0;
+        fprintf(stderr,
+                "[bench] tiles=%d fill=%.3f slide=%.3f l1=%.3f exact=%.3f "
+                "sum_total=%.3f wall=%.3f points=%lld\n",
+                ntx * ntz, st->t_fill, st->t_slide, st->t_l1, st->t_exact,
+                st->t_total, wall, (long long)st->points);
+    }
     st->t_total = now_sec() - t0;
     return 1;
 
@@ -1264,6 +1419,7 @@ stopped:
     aux_progress_end();
     for (t = 0; t < ntx * ntz; t++) { free(tr[t].hx); free(tr[t].hz); }
     free(tr);
+    free(shared_ef); free(shared_hf);
     free(ax); free(az);
     *hits_x = NULL; *nhits_x = 0;
     *hits_z = NULL; *nhits_z = 0;
@@ -1297,6 +1453,38 @@ typedef struct {
     ScanStats st;
 } TileOut;
 
+typedef struct {
+    const Climate *c;
+    const ScanCfg *cfg;
+    int64_t bx0, bz0, bx1, bz1, tw, th, overlap, step_l0;
+    int ntx;
+    double m_e, m_h, bg;
+    TileOut *tr;
+} ScreenTileCtx;
+
+static void screen_tile_task(void *ptr, int t)
+{
+    ScreenTileCtx *q = (ScreenTileCtx *)ptr;
+    int64_t xa, xb, za, zb;
+    int xx = t % q->ntx, zz = t / q->ntx;
+    xa = q->bx0 + (int64_t)xx * q->tw;
+    za = q->bz0 + (int64_t)zz * q->th;
+    xb = xa + q->tw; if (xb > q->bx1) xb = q->bx1;
+    zb = za + q->th; if (zb > q->bz1) zb = q->bz1;
+    if (xa >= xb || za >= zb) return;
+    if (cts_checkpoint()) return;
+    xa -= q->overlap; if (xa < q->bx0) xa = q->bx0;
+    za -= q->overlap; if (za < q->bz0) za = q->bz0;
+    xb += q->overlap; if (xb > q->bx1) xb = q->bx1;
+    zb += q->overlap; if (zb > q->bz1) zb = q->bz1;
+    xa = align_tile_start(xa, q->bx0, q->step_l0);
+    za = align_tile_start(za, q->bz0, q->step_l0);
+    ++tile_depth;
+    screen_area(q->c, xa, za, xb, zb, q->cfg, q->step_l0, q->m_e, q->m_h, q->bg,
+                &q->tr[t].hits, &q->tr[t].nhits, &q->tr[t].st);
+    --tile_depth;
+}
+
 int screen_area_parallel(const Climate *c, int64_t bx0, int64_t bz0,
                          int64_t bx1, int64_t bz1, const ScanCfg *cfg,
                          int64_t step_l0, double m_e, double m_h, double bg,
@@ -1310,16 +1498,14 @@ int screen_area_parallel(const Climate *c, int64_t bx0, int64_t bz0,
     size_t total = 0;
     Hit *all = NULL;
     int i;
-#ifdef _OPENMP
-    if (threads <= 0) nt = omp_get_max_threads();
+    if (threads <= 0) nt = cts_cpu_count();
     {
-        int procs = omp_get_num_procs();
+        int procs = cts_cpu_count();
         if (procs > 0) {
             if (nt > procs) nt = procs;
             if (gridNt > procs) gridNt = procs;
         }
     }
-#endif
     if (nt < 1) nt = 1;
     if (gridNt < 1) gridNt = 1;
     {
@@ -1356,26 +1542,10 @@ int screen_area_parallel(const Climate *c, int64_t bx0, int64_t bz0,
                            bg, hits, nhits, st);
     preset_tile_rows(ntx, ntz, bx0, bz0, bx1, bz1, tw, th, overlap, step_l0, cfg, 1);
 
-#pragma omp parallel for schedule(dynamic,1) num_threads(nt)
-    for (t = 0; t < ntx * ntz; t++) {
-        int64_t xa, xb, za, zb;
-        int xx = t % ntx, zz = t / ntx;
-        xa = bx0 + (int64_t)xx * tw;
-        za = bz0 + (int64_t)zz * th;
-        xb = xa + tw; if (xb > bx1) xb = bx1;
-        zb = za + th; if (zb > bz1) zb = bz1;
-        if (xa >= xb || za >= zb) continue;
-        if (cts_checkpoint()) continue;
-        xa -= overlap; if (xa < bx0) xa = bx0;
-        za -= overlap; if (za < bz0) za = bz0;
-        xb += overlap; if (xb > bx1) xb = bx1;
-        zb += overlap; if (zb > bz1) zb = bz1;
-        xa = align_tile_start(xa, bx0, step_l0);
-        za = align_tile_start(za, bz0, step_l0);
-        ++tile_depth;
-        screen_area(c, xa, za, xb, zb, cfg, step_l0, m_e, m_h, bg,
-                    &tr[t].hits, &tr[t].nhits, &tr[t].st);
-        --tile_depth;
+    {
+        ScreenTileCtx tctx = {c, cfg, bx0, bz0, bx1, bz1, tw, th, overlap, step_l0,
+                              ntx, m_e, m_h, bg, tr};
+        cts_parallel_for(ntx * ntz, nt, 1, screen_tile_task, &tctx);
     }
     prog_preset = 0;
     if (cts_stopped())

@@ -6,6 +6,7 @@
 #include "cubiomes/util.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -805,14 +806,21 @@ std::vector<FlowerRow> runFlowerFarmSearchRows(
     std::atomic<int> verified{0};
     if (taskCount > 0)
     {
-#pragma omp parallel num_threads(verifyThreads)
-        {
-            std::vector<OutRow> local;
+        /* Per-worker result buckets: merging once after the join is cheaper
+         * than a critical section and keeps the output order deterministic
+         * (worker id, then task order).  The final sort/dedupe below is the
+         * authoritative ordering, so this only affects exact ties. */
+        std::vector<std::vector<OutRow>> locals((size_t) verifyThreads);
+        std::atomic<int> nextTask{0};
+        auto worker = [&](int wid) {
+            std::vector<OutRow> &local = locals[(size_t) wid];
             local.reserve(64);
             VerifyScratch scratch;
-#pragma omp for schedule(dynamic, 1)
-            for (int i = 0; i < taskCount; i++)
+            for (;;)
             {
+                const int i = nextTask.fetch_add(1, std::memory_order_relaxed);
+                if (i >= taskCount)
+                    break;
                 if (!keep.load(std::memory_order_relaxed))
                     continue;
                 const VerifyTask &task = tasks[(size_t) i];
@@ -836,12 +844,20 @@ std::vector<FlowerRow> runFlowerFarmSearchRows(
                     setOverall(control, phase1Total + n, overallTotal);
                 }
             }
-#pragma omp critical(fff_verify_merge)
-            {
-                rows.insert(rows.end(), std::make_move_iterator(local.begin()),
-                            std::make_move_iterator(local.end()));
-            }
+        };
+        std::vector<std::thread> pool;
+        pool.reserve((size_t) std::max(0, verifyThreads - 1));
+        for (int w = 1; w < verifyThreads; ++w)
+            pool.emplace_back(worker, w);
+        worker(0);
+        for (std::thread &thread : pool)
+        {
+            if (thread.joinable())
+                thread.join();
         }
+        for (const auto &local : locals)
+            rows.insert(rows.end(), std::make_move_iterator(local.begin()),
+                        std::make_move_iterator(local.end()));
     }
     std::free(hits);
     std::free(hitsZ);

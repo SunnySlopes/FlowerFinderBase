@@ -4,10 +4,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _OPENMP
-#include <omp.h>
-#endif
-
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -273,10 +269,25 @@ void window_eval_rect(const Climate *c, int qx, int qz, int winx, int winz,
     w->h_min_qx = w->h_min_qz = w->h_max_qx = w->h_max_qz = -1;
     w->pass = 0;
     for (iz = 0; iz < winz; iz++) {
-        for (ix = 0; ix < winx; ix++) {
+        const double z = (double)(qz + iz);
+        for (ix = 0; ix + 4 <= winx; ix += 4) {
+            double qx4[4], e4[4], h4[4];
+            int k;
+            for (k = 0; k < 4; ++k)
+                qx4[k] = (double)(qx + ix + k);
+            climate_sample4(c, qx4, z, shift, e4, h4);
+            for (k = 0; k < 4; ++k) {
+                const int px = qx + ix + k;
+                const double e = e4[k], h = h4[k];
+                if (e < w->e_min) { w->e_min = e; w->e_min_qx = px; w->e_min_qz = qz+iz; }
+                if (e > w->e_max) { w->e_max = e; w->e_max_qx = px; w->e_max_qz = qz+iz; }
+                if (h < w->h_min) { w->h_min = h; w->h_min_qx = px; w->h_min_qz = qz+iz; }
+                if (h > w->h_max) { w->h_max = h; w->h_max_qx = px; w->h_max_qz = qz+iz; }
+            }
+        }
+        for (; ix < winx; ix++) {
             double e, h;
-            climate_sample(c, (double)(qx + ix), (double)(qz + iz),
-                           shift, &e, &h);
+            climate_sample(c, (double)(qx + ix), z, shift, &e, &h);
             if (e < w->e_min) { w->e_min = e; w->e_min_qx = qx+ix; w->e_min_qz = qz+iz; }
             if (e > w->e_max) { w->e_max = e; w->e_max_qx = qx+ix; w->e_max_qz = qz+iz; }
             if (h < w->h_min) { w->h_min = h; w->h_min_qx = qx+ix; w->h_min_qz = qz+iz; }
